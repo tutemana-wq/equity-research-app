@@ -1,0 +1,32 @@
+name: Daily Equity Research Briefing
+
+on:
+  schedule:
+    - cron: '10 10 * * *' # Runs at 7:10 AM ART (10:10 UTC)
+  workflow_dispatch: # This adds the "Run Workflow" button you were looking for
+
+jobs:
+  run-research:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install Libraries
+        run: |
+          pip install supabase resend google-genai requests python-dotenv
+
+      - name: Run Script
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          SEC_API_KEY: ${{ secrets.SEC_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          EMAIL_RECIPIENT: ${{ secrets.EMAIL_RECIPIENT }}
+        run: python main.py
