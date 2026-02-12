@@ -19,7 +19,7 @@ jobs:
 
       - name: Install Libraries
         run: |
-          pip install supabase resend google-genai requests python-dotenv
+          pip install supabase resend google-genai requests python-dotenv sec-api
 
       - name: Run Script
         env:
