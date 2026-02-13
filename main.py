@@ -520,10 +520,10 @@ def summarize_filing_with_gemini(
 def search_web_and_ir_for_ticker(ticker, company_name):
     api_key = os.getenv("TAVILY_API_KEY")
     if not api_key: return []
-clean_name = company_name.replace(", Inc.", "").replace(" Inc.", "").replace(" Corp.", "").replace(" Ltd.", "").strip()
+    clean_name = company_name.replace(", Inc.", "").replace(" Inc.", "").replace(" Corp.", "").replace(" Ltd.", "").strip()
     now_utc = datetime.now(timezone.utc)
     current_year = now_utc.year
-headers = {"Authorization": f"Bearer {api_key}"}
+    headers = {"Authorization": f"Bearer {api_key}"}
     base_payload = {
         "search_depth": "advanced",
         "max_results": 5,
@@ -532,7 +532,7 @@ headers = {"Authorization": f"Bearer {api_key}"}
         "start_date": (now_utc - timedelta(hours=WEB_LOOKBACK_HOURS)).date().isoformat(),
         "end_date": now_utc.date().isoformat(),
     }
- queries = [
+    queries = [
         f"{clean_name} {ticker} investor relations news {current_year}",
         f"{clean_name} {ticker} earnings press release {current_year}",
         f"{clean_name} {ticker} official announcement {current_year}"
@@ -545,14 +545,14 @@ headers = {"Authorization": f"Bearer {api_key}"}
                 all_results.extend(resp.json().get("results", []))
         except Exception as exc:
             logging.error(f"Search failed for {q}: {exc}")
-unique_results = []
+    unique_results = []
     seen_urls = set()
     for r in all_results:
         url = r.get("url")
         if url and url not in seen_urls:
             seen_urls.add(url)
             unique_results.append(r)
-logging.info("Found %d unique results for %s.", len(unique_results), ticker)
+    logging.info("Found %d unique results for %s.", len(unique_results), ticker)
     return unique_results
 
 
