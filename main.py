@@ -21,6 +21,7 @@ Dependencies (install via pip, e.g. in a virtualenv):
 import logging
 import os
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
@@ -891,6 +892,8 @@ def main() -> None:
                     "source_url": None,
                     "is_no_news": True,
                 })
+            print("Rate limit protection: Sleeping for 10 seconds before the next ticker...")
+            time.sleep(10)
 
     # TICKER PROCESSING FINISHED - Now sending email
     print(f"\n{'='*60}")
