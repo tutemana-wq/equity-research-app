@@ -517,97 +517,55 @@ def summarize_filing_with_gemini(
     return generate_content_with_failover(prompt, client)
 
 
-def search_web_and_ir_for_ticker(ticker: str, company_name: str) -> List[Dict]:
-    """
-    Use Tavily Search API to find recent CEO interviews, press releases,
-    YouTube appearances, and investor relations presentations for the ticker
-    within the last WEB_LOOKBACK_HOURS.
-
-    Uses specific intent keywords and excludes generic market summaries,
-    price forecasts, and stock price discussions.
-
-    Requires TAVILY_API_KEY in the environment. If it's missing or the API
-    fails, this function returns an empty list and logs the issue.
-    """
+def search_web_and_ir_for_ticker(ticker, company_name):
     api_key = os.getenv("TAVILY_API_KEY")
-    if not api_key:
-        logging.info(
-            "TAVILY_API_KEY not set; skipping web and investor relations search "
-            "for %s.",
-            ticker,
-        )
-        return []
+    if not api_key: return []
 
+    # 1. FIX: Remove "Inc." so we find "Xponential Fitness" news
+    clean_name = company_name.replace(", Inc.", "").replace(" Inc.", "").replace(" Corp.", "").replace(" Ltd.", "").strip()
+    
+    # 2. FIX: Dynamic Year
     now_utc = datetime.now(timezone.utc)
-    start_date = (now_utc - timedelta(hours=WEB_LOOKBACK_HOURS)).date().isoformat()
-    end_date = now_utc.date().isoformat()
-
+    current_year = now_utc.year
+    
     headers = {"Authorization": f"Bearer {api_key}"}
-
+    
+    # 3. FIX: Use 'news' topic to catch PRs
     base_payload = {
         "search_depth": "advanced",
-        "max_results": 10,
-        "topic": "finance",
+        "max_results": 5,
+        "topic": "news", 
         "include_answer": False,
-        "include_images": False,
-        "include_raw_content": False,
-        "start_date": start_date,
-        "end_date": end_date,
+        "start_date": (now_utc - timedelta(hours=WEB_LOOKBACK_HOURS)).date().isoformat(),
+        "end_date": now_utc.date().isoformat(),
     }
 
-    # Use full company name for autonomous search
-    # Prioritize official investor relations and press release sources
+    # 4. FIX: Targeted queries
     queries = [
-        f'"{company_name}" investor relations official news 2026',
-        f'"{company_name}" {ticker} press release 2026',
+        f"{clean_name} {ticker} investor relations news {current_year}",
+        f"{clean_name} {ticker} earnings press release {current_year}",
+        f"{clean_name} {ticker} official announcement {current_year}"
     ]
 
-    all_results: List[Dict] = []
-
-    for q in queries:
-        payload = {**base_payload, "query": q}
-        logging.info("Searching Tavily for '%s'.", q)
+all_results = []
+›    for q in queries:
         try:
-            resp = requests.post(
-                TAVILY_SEARCH_URL, json=payload, headers=headers, timeout=30
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            results = data.get("results", [])
-            all_results.extend(results)
-        except Exception as exc:  # pragma: no cover - network / API issues
-            logging.error("Error calling Tavily for query '%s': %s", q, exc)
-            continue
+            resp = requests.post(TAVILY_SEARCH_URL, json={**base_payload, "query": q}, headers=headers, timeout=30)
+            if resp.status_code == 200:
+                all_results.extend(resp.json().get("results", []))
+        except Exception as exc:
+            logging.error(f"Search failed for {q}: {exc}")
 
     # De-duplicate results by URL
-    unique_results: List[Dict] = []
+    unique_results = []
     seen_urls = set()
     for r in all_results:
         url = r.get("url")
-        if not url or url in seen_urls:
-            continue
-        seen_urls.add(url)
-        unique_results.append(r)
+        if url and url not in seen:
+            seen.add(url)
+            unique_results.append(r)
 
-    # Prioritize URLs from official sources (businesswire, globenewswire, prnewswire, investor)
-    priority_sources = ["businesswire", "globenewswire", "prnewswire", "investor"]
-
-    def get_priority(result: Dict) -> int:
-        """Return priority score (lower is better) based on URL."""
-        url = result.get("url", "").lower()
-        for i, source in enumerate(priority_sources):
-            if source in url:
-                return i
-        return len(priority_sources)  # Non-priority sources get lowest priority
-
-    unique_results.sort(key=get_priority)
-
-    logging.info(
-        "Found %d unique web/IR results for %s within the last %d hours.",
-        len(unique_results),
-        ticker,
-        WEB_LOOKBACK_HOURS,
-    )
+    logging.info("Found %d unique results for %s.", len(unique_results), ticker)
     return unique_results
 
 
