@@ -2,8 +2,8 @@ name: Daily Equity Research Briefing
 
 on:
   schedule:
-    - cron: '37 09 * * *'  # This is 6:37 AM ART
-  workflow_dispatch: # This adds the "Run Workflow" button you were looking for
+    - cron: '0 13 * * *'  # Runs at 8:00 AM EST (13:00 UTC) every day
+  workflow_dispatch: # Allows manual triggering via "Run workflow" button
 
 jobs:
   run-research:
@@ -19,14 +19,16 @@ jobs:
 
       - name: Install Libraries
         run: |
-          pip install supabase resend google-genai requests python-dotenv sec-api
+          pip install supabase resend google-genai requests python-dotenv anthropic
 
       - name: Run Script
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-          SEC_API_KEY: ${{ secrets.SEC_API_KEY }}
+          SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
           EMAIL_RECIPIENT: ${{ secrets.EMAIL_RECIPIENT }}
         run: python main.py

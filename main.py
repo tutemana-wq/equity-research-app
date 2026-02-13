@@ -1,21 +1,23 @@
 """
-Main script for Equity Research App.
+Universal SEC & News Monitor - Automated Daily Briefing
 
 Workflow:
 1. Load environment variables from `.env`.
 2. Connect to Supabase and read tickers from the `watchlist` table.
-3. For each ticker, query SEC-API for 8-K filings from the last 48 hours.
-4. For each filing, send the filing text to Gemini 3 Flash via `google-genai`
+3. For each ticker, query SEC EDGAR (free public API) for ALL filing types from the last 24 hours.
+   - Categorize filings: Crucial (8-K, 10-Q, 10-K), Insider/Ownership (Form 3/4/5, SC 13D/G), Other
+4. For each filing, send the filing text to Gemini 3 Flash (with Anthropic failover)
    to generate a 3-bullet investor risk summary.
-5. Use Tavily (or compatible web search) to find recent CEO interviews,
-   press releases, YouTube appearances, and investor relations presentations
+5. Use Tavily advanced search to find official investor relations news and press releases
    for each ticker from the last 72 hours.
-6. Summarize all findings into 3-bullet investor risk summaries with Gemini.
+   - Prioritize URLs from: businesswire, globenewswire, prnewswire, investor
+6. Summarize all findings into 3-bullet investor risk summaries with AI (Gemini → Anthropic failover).
 7. Save summaries into the `reports` table in Supabase, including a
    'No news found' entry when nothing relevant is detected.
+8. Send email with all findings, each with direct clickable links.
 
 Dependencies (install via pip, e.g. in a virtualenv):
-    pip install python-dotenv supabase sec-api google-genai requests resend
+    pip install python-dotenv supabase google-genai requests resend anthropic
 """
 
 import logging
@@ -28,9 +30,16 @@ from typing import Dict, List, Optional
 import requests
 import resend
 from dotenv import load_dotenv
-from sec_api import QueryApi
 from supabase import Client, create_client
 from google import genai
+
+# Try to import Anthropic for failover
+try:
+    import anthropic
+    ANTHROPIC_AVAILABLE = True
+except ImportError:
+    ANTHROPIC_AVAILABLE = False
+    anthropic = None
 
 
 # ---------- Configuration ----------
@@ -45,8 +54,13 @@ DEFAULT_GEMINI_MODEL = "gemini-3-flash-preview"
 MAX_FILING_CHARS = 20_000
 
 # Lookback window for SEC filings (hours) and web/IR search (hours)
+# SEC: 48 hours normally, 72 hours on Monday (to catch Friday filings)
 SEC_LOOKBACK_HOURS = 48
 WEB_LOOKBACK_HOURS = 72
+
+# Filing categorization
+CRUCIAL_FILINGS = ["8-K", "10-Q", "10-K", "10-Q/A", "10-K/A", "8-K/A"]
+INSIDER_OWNERSHIP_FILINGS = ["3", "4", "5", "SC 13D", "SC 13D/A", "SC 13G", "SC 13G/A"]
 
 # Tavily search endpoint (used via HTTP, no SDK required)
 TAVILY_SEARCH_URL = "https://api.tavily.com/search"
@@ -68,9 +82,13 @@ def load_environment() -> None:
     required_keys = [
         "SUPABASE_URL",
         "SUPABASE_KEY",  # service role or anon key with needed perms
-        "SEC_API_KEY",
-        "GEMINI_API_KEY",  # used by google-genai
+        "SEC_USER_AGENT",  # replaces SEC_API_KEY
+        "GEMINI_API_KEY",  # used by google-genai (primary AI)
         "RESEND_API_KEY",  # used for email sending
+    ]
+
+    optional_keys = [
+        "ANTHROPIC_API_KEY",  # used for AI failover when Gemini quota exceeded
     ]
 
     for key in required_keys:
@@ -80,6 +98,19 @@ def load_environment() -> None:
     if missing:
         raise RuntimeError(
             f"Missing required environment variables in .env: {', '.join(missing)}"
+        )
+
+    # Check optional keys and log warnings
+    for key in optional_keys:
+        if not os.getenv(key):
+            logging.info("Optional environment variable '%s' not set. AI failover will not be available.", key)
+
+    # Validate SEC_USER_AGENT format
+    sec_user_agent = os.getenv("SEC_USER_AGENT", "")
+    if sec_user_agent and not re.match(r".+\s+<.+@.+\..+>", sec_user_agent):
+        logging.warning(
+            "SEC_USER_AGENT should be in format 'Name <email@example.com>' "
+            "to comply with SEC fair access policy."
         )
 
 
@@ -97,10 +128,186 @@ def get_gemini_client() -> genai.Client:
     return client
 
 
-def get_sec_query_api() -> QueryApi:
-    """Create and return a SEC-API QueryApi client."""
-    api_key = os.environ["SEC_API_KEY"]
-    return QueryApi(api_key=api_key)
+# Global cache for company tickers mapping
+_COMPANY_TICKERS_CACHE: Optional[Dict[str, int]] = None
+
+
+def get_company_tickers_mapping() -> Dict[str, int]:
+    """
+    Download and cache SEC company tickers to CIK mapping.
+    Returns a dict mapping uppercase ticker -> CIK integer.
+    Uses session-level caching to avoid repeated downloads.
+    """
+    global _COMPANY_TICKERS_CACHE
+
+    if _COMPANY_TICKERS_CACHE is not None:
+        return _COMPANY_TICKERS_CACHE
+
+    url = "https://www.sec.gov/files/company_tickers.json"
+    user_agent = os.getenv("SEC_USER_AGENT", "Unknown <unknown@unknown.com>")
+    headers = {"User-Agent": user_agent}
+
+    logging.info("Downloading SEC company tickers mapping from %s", url)
+    try:
+        resp = requests.get(url, headers=headers, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as exc:
+        logging.error("Error downloading company tickers mapping: %s", exc, exc_info=True)
+        return {}
+
+    # Parse JSON structure: {"0": {"cik_str": 320193, "ticker": "AAPL", ...}, ...}
+    mapping: Dict[str, int] = {}
+    for entry in data.values():
+        if isinstance(entry, dict):
+            ticker = entry.get("ticker")
+            cik_str = entry.get("cik_str")
+            if ticker and cik_str is not None:
+                mapping[ticker.upper()] = int(cik_str)
+
+    _COMPANY_TICKERS_CACHE = mapping
+    return mapping
+
+
+def ticker_to_cik(ticker: str, mapping: Dict[str, int]) -> Optional[int]:
+    """
+    Look up CIK number for a ticker using the provided mapping.
+    Returns CIK integer or None if not found.
+    """
+    return mapping.get(ticker.upper())
+
+
+def fetch_company_submissions(cik: int) -> Dict:
+    """
+    Fetch company submissions data from SEC EDGAR API.
+    CIK is zero-padded to 10 digits for the API request.
+    Returns full submissions JSON or empty dict on error.
+    Includes rate limiting delay (0.11s) to stay under SEC's 10 req/sec limit.
+    """
+    # Zero-pad CIK to 10 digits for SEC API
+    cik_padded = f"{cik:010d}"
+    url = f"https://data.sec.gov/submissions/CIK{cik_padded}.json"
+    user_agent = os.getenv("SEC_USER_AGENT", "Unknown <unknown@unknown.com>")
+    headers = {"User-Agent": user_agent}
+
+    logging.debug("Fetching submissions for CIK %s from %s", cik_padded, url)
+
+    # Rate limiting: 0.11 seconds = ~9 requests/second (SEC allows 10)
+    time.sleep(0.11)
+
+    try:
+        resp = requests.get(url, headers=headers, timeout=30)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as exc:
+        logging.error("Error fetching submissions for CIK %s: %s", cik, exc, exc_info=True)
+        return {}
+
+
+def construct_filing_urls(cik: int, accession_number: str, primary_document: str) -> Dict[str, str]:
+    """
+    Construct HTML and TXT URLs for a SEC filing.
+
+    Args:
+        cik: Company CIK (will be used without padding in URL)
+        accession_number: Accession number with dashes (e.g., "0001234567-23-000001")
+        primary_document: Primary document filename (e.g., "aapl-20230701.htm")
+
+    Returns:
+        Dict with "linkToHtml" and "linkToTxt" keys
+    """
+    # Remove dashes from accession number for URL path
+    acc_no_nodashes = accession_number.replace("-", "")
+
+    # Build URLs (CIK without padding)
+    base_url = f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc_no_nodashes}"
+
+    urls = {
+        "linkToTxt": f"{base_url}.txt"
+    }
+
+    # Add HTML URL only if primary document is provided
+    if primary_document:
+        urls["linkToHtml"] = f"{base_url}/{primary_document}"
+
+    return urls
+
+
+def categorize_filing(form_type: str) -> str:
+    """
+    Categorize a filing type into Crucial, Insider/Ownership, or Other.
+
+    Returns:
+        "Crucial", "Insider/Ownership", or "Other"
+    """
+    if form_type in CRUCIAL_FILINGS:
+        return "Crucial"
+    elif form_type in INSIDER_OWNERSHIP_FILINGS:
+        return "Insider/Ownership"
+    else:
+        return "Other"
+
+
+def parse_recent_filings(submissions_data: Dict, form_type: Optional[str], since: datetime) -> List[Dict]:
+    """
+    Parse recent filings from submissions data.
+    Filters by form type (optional) and filing date.
+
+    Args:
+        submissions_data: Full submissions JSON from SEC API
+        form_type: Form type to filter (e.g., "8-K"), or None to fetch all types
+        since: Only include filings accepted on or after this datetime
+
+    Returns:
+        List of filing dicts with keys: accessionNo, filedAt, formType, primaryDocument, category
+    """
+    filings_section = submissions_data.get("filings", {}).get("recent", {})
+    if not filings_section:
+        return []
+
+    # SEC data is columnar - same index across all arrays represents one filing
+    accession_numbers = filings_section.get("accessionNumber", [])
+    filing_dates = filings_section.get("filingDate", [])
+    acceptance_datetimes = filings_section.get("acceptanceDateTime", [])
+    forms = filings_section.get("form", [])
+    primary_documents = filings_section.get("primaryDocument", [])
+
+    result: List[Dict] = []
+
+    for i in range(len(accession_numbers)):
+        # Filter by form type (exact match) - skip if form_type specified and doesn't match
+        current_form = forms[i] if i < len(forms) else None
+        if form_type is not None and current_form != form_type:
+            continue
+
+        # Filter by acceptance datetime
+        if i < len(acceptance_datetimes):
+            acceptance_dt_str = acceptance_datetimes[i]
+            try:
+                acceptance_dt = datetime.fromisoformat(
+                    acceptance_dt_str.replace("Z", "+00:00")
+                ).astimezone(timezone.utc)
+
+                if acceptance_dt < since:
+                    continue
+            except Exception as exc:
+                logging.warning("Error parsing acceptance datetime '%s': %s", acceptance_dt_str, exc)
+                # Include the filing if we can't parse the date (better to include than miss)
+
+        # Build filing dict with category
+        filing_form_type = forms[i] if i < len(forms) else "Unknown"
+        filing = {
+            "accessionNo": accession_numbers[i] if i < len(accession_numbers) else None,
+            "filedAt": acceptance_datetimes[i] if i < len(acceptance_datetimes) else (
+                filing_dates[i] if i < len(filing_dates) else None
+            ),
+            "formType": filing_form_type,
+            "primaryDocument": primary_documents[i] if i < len(primary_documents) else None,
+            "category": categorize_filing(filing_form_type),
+        }
+        result.append(filing)
+
+    return result
 
 
 def fetch_watchlist_tickers(supabase: Client) -> Dict[str, str]:
@@ -133,69 +340,58 @@ def fetch_watchlist_tickers(supabase: Client) -> Dict[str, str]:
     return ticker_to_name
 
 
-def query_recent_8k_filings_for_ticker(
-    query_api: QueryApi, ticker: str, since: datetime
+def query_recent_filings_for_ticker(
+    ticker: str, since: datetime, ticker_cik_mapping: Dict[str, int], form_type: Optional[str] = None
 ) -> List[Dict]:
     """
-    Use SEC-API's QueryApi to fetch 8-K filings for a ticker since the given datetime.
+    Fetch all SEC filings for a ticker from SEC EDGAR using free public APIs.
+    Uses direct SEC access, replacing the paid sec-api service.
 
-    SEC-API query syntax example:
-      ticker:TSLA AND filedAt:[2020-01-01 TO 2020-12-31] AND formType:"10-Q"
-    We'll adapt this to 8-K and limit to the last ~48 hours.
+    Args:
+        ticker: Stock ticker symbol
+        since: Only return filings accepted on or after this datetime
+        ticker_cik_mapping: Dict mapping ticker -> CIK number
+        form_type: Optional form type to filter (e.g., "8-K"), None for all types
+
+    Returns:
+        List of filing dicts with category, formType, URLs, etc.
     """
-    # Use only date part in query; we'll filter by exact time client-side.
-    start_date = since.date().isoformat()
-    end_date = datetime.now(timezone.utc).date().isoformat()
+    filing_msg = f"all filings" if form_type is None else f"{form_type} filings"
+    logging.info("Querying SEC EDGAR for recent %s for %s.", filing_msg, ticker)
 
-    query_string = (
-        f"ticker:{ticker} AND filedAt:[{start_date} TO {end_date}] "
-        f'AND formType:"8-K"'
-    )
-
-    query = {
-        "query": query_string,
-        "from": "0",
-        "size": "50",  # up to 50 recent filings per ticker
-        "sort": [{"filedAt": {"order": "desc"}}],
-    }
-
-    logging.info("Querying SEC-API for recent 8-K filings for %s.", ticker)
-    try:
-        result = query_api.get_filings(query)
-    except Exception as exc:  # pragma: no cover - network / API issues
-        logging.error(
-            "Error querying SEC-API for ticker %s: %s", ticker, exc, exc_info=True
-        )
+    # Look up CIK for ticker
+    cik = ticker_to_cik(ticker, ticker_cik_mapping)
+    if cik is None:
+        logging.warning("Ticker %s not found in SEC company tickers mapping.", ticker)
         return []
 
-    filings = result.get("filings", []) if isinstance(result, dict) else []
+    # Fetch company submissions from SEC
+    submissions = fetch_company_submissions(cik)
+    if not submissions:
+        logging.warning("No submissions data found for ticker %s (CIK: %s).", ticker, cik)
+        return []
 
-    # Filter by actual datetime (last 48 hours)
-    recent_filings: List[Dict] = []
+    # Parse recent filings (all types if form_type is None)
+    filings = parse_recent_filings(submissions, form_type, since)
+
+    # Add URLs to each filing
     for filing in filings:
-        filed_at_str = filing.get("filedAt")
-        if not filed_at_str:
-            continue
-        try:
-            filed_at = datetime.fromisoformat(
-                filed_at_str.replace("Z", "+00:00")
-            ).astimezone(timezone.utc)
-        except Exception:
-            # If parsing fails, keep the filing (better to include than miss)
-            recent_filings.append(filing)
-            continue
+        accession_no = filing.get("accessionNo")
+        primary_doc = filing.get("primaryDocument")
 
-        if filed_at >= since:
-            recent_filings.append(filing)
+        if accession_no:
+            urls = construct_filing_urls(cik, accession_no, primary_doc)
+            filing.update(urls)
 
-    return recent_filings
+    logging.info("Found %d recent %s for %s.", len(filings), filing_msg, ticker)
+    return filings
 
 
 def fetch_filing_text(filing: Dict) -> Optional[str]:
     """
-    Download the filing text using the HTML or TXT link returned by SEC-API.
+    Download the filing text using the HTML or TXT link.
 
-    The QueryApi response typically includes `linkToHtml` and `linkToTxt`.
+    The filing dict includes `linkToHtml` and `linkToTxt`.
     We'll try HTML first, then TXT.
     """
     url = filing.get("linkToHtml") or filing.get("linkToTxt")
@@ -206,8 +402,12 @@ def fetch_filing_text(filing: Dict) -> Optional[str]:
         )
         return None
 
+    # Add User-Agent header for SEC compliance
+    user_agent = os.getenv("SEC_USER_AGENT", "Unknown <unknown@unknown.com>")
+    headers = {"User-Agent": user_agent}
+
     try:
-        resp = requests.get(url, timeout=30)
+        resp = requests.get(url, headers=headers, timeout=30)
         resp.raise_for_status()
     except Exception as exc:  # pragma: no cover - network issues
         logging.error("Error downloading filing text from %s: %s", url, exc)
@@ -230,6 +430,65 @@ def fetch_filing_text(filing: Dict) -> Optional[str]:
     return text
 
 
+def generate_content_with_failover(prompt: str, gemini_client: genai.Client) -> str:
+    """
+    Generate content using Gemini first, with automatic failover to Anthropic if quota exceeded.
+
+    Args:
+        prompt: The prompt to send to the AI
+        gemini_client: Gemini client instance
+
+    Returns:
+        Generated text response
+    """
+    model = os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
+
+    # Try Gemini first (free)
+    try:
+        logging.debug("Attempting to generate content with Gemini...")
+        response = gemini_client.models.generate_content(
+            model=model,
+            contents=prompt,
+        )
+        summary = getattr(response, "text", None) or ""
+        return summary.strip()
+    except Exception as exc:
+        error_str = str(exc)
+
+        # Check if it's a quota/rate limit error
+        if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str or "quota" in error_str.lower():
+            logging.warning("Gemini quota exceeded, attempting failover to Anthropic...")
+
+            # Failover to Anthropic (paid)
+            if ANTHROPIC_AVAILABLE and os.getenv("ANTHROPIC_API_KEY"):
+                try:
+                    anthropic_client = anthropic.Anthropic(
+                        api_key=os.environ["ANTHROPIC_API_KEY"]
+                    )
+
+                    message = anthropic_client.messages.create(
+                        model="claude-3-5-sonnet-20241022",
+                        max_tokens=1024,
+                        messages=[
+                            {"role": "user", "content": prompt}
+                        ]
+                    )
+
+                    response_text = message.content[0].text if message.content else ""
+                    logging.info("Successfully used Anthropic failover.")
+                    return response_text.strip()
+                except Exception as anthropic_exc:
+                    logging.error("Anthropic failover also failed: %s", anthropic_exc, exc_info=True)
+                    raise
+            else:
+                logging.error("Anthropic not available for failover (missing library or API key)")
+                raise
+
+        # If not a quota error, re-raise
+        logging.error("Error calling Gemini (non-quota): %s", exc, exc_info=True)
+        raise
+
+
 def summarize_filing_with_gemini(
     client: genai.Client, filing_text: str, ticker: str
 ) -> str:
@@ -240,11 +499,9 @@ def summarize_filing_with_gemini(
     print("--- Rate Limit Protection: Sleeping for 12 seconds ---")
     time.sleep(12)
 
-    model = os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
-
     prompt = (
         f"You are an elite researcher and gatekeeper.\n\n"
-        f"CRITICAL: If the provided SEC Form 8-K filing text is a generic market summary, "
+        f"CRITICAL: If the provided SEC filing text is a generic market summary, "
         f"a price forecast, routine administrative filing, or not specifically about a major "
         f"company event (like executive changes, material agreements, financial restatements, "
         f"or significant business developments), you MUST return exactly the string \"SKIP\" "
@@ -257,17 +514,7 @@ def summarize_filing_with_gemini(
         f"{filing_text}"
     )
 
-    try:
-        response = client.models.generate_content(
-            model=model,
-            contents=prompt,
-        )
-    except Exception as exc:  # pragma: no cover - network / API issues
-        logging.error("Error calling Gemini for summary: %s", exc, exc_info=True)
-        raise
-
-    summary = getattr(response, "text", None) or ""
-    return summary.strip()
+    return generate_content_with_failover(prompt, client)
 
 
 def search_web_and_ir_for_ticker(ticker: str, company_name: str) -> List[Dict]:
@@ -308,17 +555,11 @@ def search_web_and_ir_for_ticker(ticker: str, company_name: str) -> List[Dict]:
         "end_date": end_date,
     }
 
-    # Use company name in quotes for exact matching, exclude stock/forecast/price noise
+    # Use full company name for autonomous search
+    # Prioritize official investor relations and press release sources
     queries = [
-        (
-            f'"{company_name}" (interview OR "press release" OR "earnings call") '
-            f"-stock -forecast -price -trading -chart -analyst -target"
-        ),
-        (
-            f'"{company_name}" ("investor relations" OR "investor day" OR '
-            f'"investor presentation" OR "CEO" OR "executive") '
-            f"-stock -forecast -price -trading -chart"
-        ),
+        f'"{company_name}" investor relations official news 2026',
+        f'"{company_name}" {ticker} press release 2026',
     ]
 
     all_results: List[Dict] = []
@@ -347,6 +588,19 @@ def search_web_and_ir_for_ticker(ticker: str, company_name: str) -> List[Dict]:
             continue
         seen_urls.add(url)
         unique_results.append(r)
+
+    # Prioritize URLs from official sources (businesswire, globenewswire, prnewswire, investor)
+    priority_sources = ["businesswire", "globenewswire", "prnewswire", "investor"]
+
+    def get_priority(result: Dict) -> int:
+        """Return priority score (lower is better) based on URL."""
+        url = result.get("url", "").lower()
+        for i, source in enumerate(priority_sources):
+            if source in url:
+                return i
+        return len(priority_sources)  # Non-priority sources get lowest priority
+
+    unique_results.sort(key=get_priority)
 
     logging.info(
         "Found %d unique web/IR results for %s within the last %d hours.",
@@ -390,8 +644,6 @@ def summarize_external_with_gemini(
         )
         combined_text = combined_text[:MAX_FILING_CHARS]
 
-    model = os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
-
     prompt = (
         f"You are an elite researcher and gatekeeper.\n\n"
         f"CRITICAL: If the provided text is a generic market summary, a price forecast, "
@@ -409,19 +661,7 @@ def summarize_external_with_gemini(
         f"{combined_text}"
     )
 
-    try:
-        response = client.models.generate_content(
-            model=model,
-            contents=prompt,
-        )
-    except Exception as exc:  # pragma: no cover - network / API issues
-        logging.error(
-            "Error calling Gemini for external news summary: %s", exc, exc_info=True
-        )
-        raise
-
-    summary = getattr(response, "text", None) or ""
-    return summary.strip()
+    return generate_content_with_failover(prompt, client)
 
 
 def _format_summary_text(
@@ -522,7 +762,7 @@ def save_summary_to_supabase(
 def process_ticker(
     ticker: str,
     company_name: str,
-    query_api: QueryApi,
+    ticker_cik_mapping: Dict[str, int],
     supabase: Client,
     gemini_client: genai.Client,
 ) -> List[Dict]:
@@ -534,15 +774,24 @@ def process_ticker(
     any_summary_saved = False
     email_summaries: List[Dict] = []
 
-    # --- SEC 8-K filings (last 48 hours) ---
-    since_sec = datetime.now(timezone.utc) - timedelta(hours=SEC_LOOKBACK_HOURS)
-    filings = query_recent_8k_filings_for_ticker(query_api, ticker, since_sec)
+    # --- All SEC filings (last 48 hours, or 72 hours on Monday) ---
+    now_utc = datetime.now(timezone.utc)
+
+    # If today is Monday (weekday 0), look back 72 hours to catch Friday filings
+    if now_utc.weekday() == 0:  # Monday
+        lookback_hours = 72
+        logging.info("Monday detected: extending SEC lookback window to 72 hours to catch Friday filings.")
+    else:
+        lookback_hours = SEC_LOOKBACK_HOURS
+
+    since_sec = now_utc - timedelta(hours=lookback_hours)
+    filings = query_recent_filings_for_ticker(ticker, since_sec, ticker_cik_mapping, form_type=None)
 
     if not filings:
         logging.info(
-            "No recent 8-K filings found for %s in the last %d hours.",
+            "No recent SEC filings found for %s in the last %d hours.",
             ticker,
-            SEC_LOOKBACK_HOURS,
+            lookback_hours,
         )
     else:
         for filing in filings:
@@ -571,7 +820,9 @@ def process_ticker(
                     continue
 
                 filing_url = filing.get("linkToHtml") or filing.get("linkToTxt")
-                filing_title = f"SEC Form {filing.get('formType', '8-K')} - {company_name} ({ticker})"
+                form_type = filing.get('formType', 'Unknown')
+                category = filing.get('category', 'Other')
+                filing_title = f"[{category}] SEC Form {form_type} - {company_name} ({ticker})"
                 
                 save_summary_to_supabase(
                     supabase, ticker, filing, summary, company_name=company_name, source_url=filing_url, headline=filing_title
@@ -827,7 +1078,15 @@ def main() -> None:
 
     supabase = get_supabase_client()
     gemini_client = get_gemini_client()
-    query_api = get_sec_query_api()
+
+    # Load SEC company tickers mapping (cached for session)
+    try:
+        logging.info("Loading SEC company tickers mapping...")
+        ticker_cik_mapping = get_company_tickers_mapping()
+        logging.info("Loaded %d ticker-to-CIK mappings.", len(ticker_cik_mapping))
+    except Exception as exc:
+        logging.critical("Failed to load SEC ticker mapping: %s", exc, exc_info=True)
+        return
 
     try:
         ticker_to_name = fetch_watchlist_tickers(supabase)
@@ -849,7 +1108,7 @@ def main() -> None:
 
     for ticker, company_name in ticker_to_name.items():
         try:
-            summaries = process_ticker(ticker, company_name, query_api, supabase, gemini_client)
+            summaries = process_ticker(ticker, company_name, ticker_cik_mapping, supabase, gemini_client)
             all_summaries.extend(summaries)
             print(f"✓ Completed: {company_name} ({ticker}) - {len(summaries)} summary(ies)")
         except Exception as exc:
