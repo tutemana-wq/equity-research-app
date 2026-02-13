@@ -510,11 +510,16 @@ def summarize_filing_with_gemini(
         f"2. The direct source URL link at the very end.\n\n"
         f"- Each bullet should start with '- '.\n"
         f"- Do not include introductions or conclusions.\n\n"
-        f"CONTENT TO ANALYZE:\n"
-        f"{filing_text}" # This variable should contain the news/filing content
-    )
-
-    return generate_content_with_failover(prompt, client)
+        f"CONTENT TO ANALYZE:\n"# Retry logic for 503 errors
+    for attempt in range(3):
+        try:
+            return generate_content_with_failover(prompt, client)
+        except Exception as exc:
+            if "503" in str(exc) and attempt < 2:
+                print(f"--- Gemini busy (503). Retrying in 5s... (Attempt {attempt + 1}) ---")
+                time.sleep(5)
+                continue
+            raise exc
 
 
 def search_web_and_ir_for_ticker(ticker, company_name):
@@ -536,11 +541,12 @@ def search_web_and_ir_for_ticker(ticker, company_name):
     }
 
     # High-signal queries targeting IR and SEC filings
+    # Universal queries to catch ANY SEC filing and major corporate news
     queries = [
         f"site:sec.gov {ticker} {current_year} filing",
-        f"{clean_name} {ticker} (press release OR announcement) site:investor.apple.com OR site:ir.xponential.com", # Example pattern
-        f"{clean_name} {ticker} executive interview media",
-        f"intitle:8-K OR intitle:10-Q {ticker}"
+        f"{clean_name} {ticker} (investor relations OR IR) (news OR announcement OR press release)",
+        f"{clean_name} {ticker} (CEO OR CFO OR Executive) (interview OR appearance OR media)",
+        f"intitle:({ticker}) site:sec.gov/Archives/edgar/data"
     ]
 
     all_results = []
@@ -558,13 +564,9 @@ def search_web_and_ir_for_ticker(ticker, company_name):
         url = r.get("url")
         if url and url not in seen_urls:
             seen_urls.add(url)
-            
-            # --- MANDATORY LINK INJECTION ---
-            # We explicitly prepend the URL to the content so the AI sees it
+            # This part is CRITICAL: it glues the URL to the content for the AI
             raw_content = r.get("content", r.get("snippet", ""))
-            r["content"] = f"SOURCE URL: {url}\n\nREPORTED CONTENT: {raw_content}"
-            # --------------------------------
-            
+            r["content"] = f"SOURCE URL: {url}\n\nCONTENT: {raw_content}"
             unique_results.append(r)
 
     logging.info("Found %d unique results for %s.", len(unique_results), ticker)
