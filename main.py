@@ -548,7 +548,7 @@ def search_web_and_ir_for_ticker(ticker, company_name):
     ]
 
 all_results = []
-›    for q in queries:
+for q in queries:
         try:
             resp = requests.post(TAVILY_SEARCH_URL, json={**base_payload, "query": q}, headers=headers, timeout=30)
             if resp.status_code == 200:
