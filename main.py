@@ -520,17 +520,10 @@ def summarize_filing_with_gemini(
 def search_web_and_ir_for_ticker(ticker, company_name):
     api_key = os.getenv("TAVILY_API_KEY")
     if not api_key: return []
-
-    # 1. FIX: Remove "Inc." so we find "Xponential Fitness" news
-    clean_name = company_name.replace(", Inc.", "").replace(" Inc.", "").replace(" Corp.", "").replace(" Ltd.", "").strip()
-    
-    # 2. FIX: Dynamic Year
+clean_name = company_name.replace(", Inc.", "").replace(" Inc.", "").replace(" Corp.", "").replace(" Ltd.", "").strip()
     now_utc = datetime.now(timezone.utc)
     current_year = now_utc.year
-    
-    headers = {"Authorization": f"Bearer {api_key}"}
-    
-    # 3. FIX: Use 'news' topic to catch PRs
+headers = {"Authorization": f"Bearer {api_key}"}
     base_payload = {
         "search_depth": "advanced",
         "max_results": 5,
@@ -539,33 +532,27 @@ def search_web_and_ir_for_ticker(ticker, company_name):
         "start_date": (now_utc - timedelta(hours=WEB_LOOKBACK_HOURS)).date().isoformat(),
         "end_date": now_utc.date().isoformat(),
     }
-
-    # 4. FIX: Targeted queries
-    queries = [
+ queries = [
         f"{clean_name} {ticker} investor relations news {current_year}",
         f"{clean_name} {ticker} earnings press release {current_year}",
         f"{clean_name} {ticker} official announcement {current_year}"
     ]
-
-all_results = []
-for q in queries:
+    all_results = []
+    for q in queries:
         try:
-            resp = requests.post(TAVILY_SEARCH_URL, json={**base_payload, "query": q}, headers=headers, timeout=30)
+            resp = requests.post("https://api.tavily.com/search", json={**base_payload, "query": q}, headers=headers, timeout=30)
             if resp.status_code == 200:
                 all_results.extend(resp.json().get("results", []))
         except Exception as exc:
             logging.error(f"Search failed for {q}: {exc}")
-
-    # De-duplicate results by URL
-    unique_results = []
+unique_results = []
     seen_urls = set()
     for r in all_results:
         url = r.get("url")
-        if url and url not in seen:
-            seen.add(url)
+        if url and url not in seen_urls:
+            seen_urls.add(url)
             unique_results.append(r)
-
-    logging.info("Found %d unique results for %s.", len(unique_results), ticker)
+logging.info("Found %d unique results for %s.", len(unique_results), ticker)
     return unique_results
 
 
