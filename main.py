@@ -892,8 +892,8 @@ def main() -> None:
                     "source_url": None,
                     "is_no_news": True,
                 })
-            print("Rate limit protection: Sleeping for 10 seconds before the next ticker...")
-            time.sleep(10)
+            print("--- Rate Limit Protection: Sleeping for 12 seconds ---")
+            time.sleep(12)
 
     # TICKER PROCESSING FINISHED - Now sending email
     print(f"\n{'='*60}")
