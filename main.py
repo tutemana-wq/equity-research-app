@@ -22,7 +22,6 @@ import logging
 import os
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 
@@ -238,6 +237,9 @@ def summarize_filing_with_gemini(
     Send filing text to Gemini 3 Flash and return a 3-bullet investor risk summary.
     Acts as a gatekeeper - returns "SKIP" for irrelevant content.
     """
+    print("--- Rate Limit Protection: Sleeping for 12 seconds ---")
+    time.sleep(12)
+
     model = os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
 
     prompt = (
@@ -365,6 +367,9 @@ def summarize_external_with_gemini(
     """
     if not items:
         return ""
+
+    print("--- Rate Limit Protection: Sleeping for 12 seconds ---")
+    time.sleep(12)
 
     # Build a combined text from titles, URLs, and content snippets.
     parts: List[str] = []
@@ -761,12 +766,14 @@ def send_email_via_resend(
     recipient_email: str,
 ) -> None:
     """Send email using Resend API."""
-    api_key = os.getenv("RESEND_API_KEY")
-    if not api_key:
-        print("ERROR: RESEND_API_KEY not found; cannot send email.")
-        logging.error("RESEND_API_KEY not found; cannot send email.")
+    api_key = os.environ.get("RESEND_API_KEY", "").strip()
+    if not api_key or api_key == "***":
+        print("ERROR: RESEND_API_KEY is missing or invalid. Check your .env file.")
+        print("  - Ensure RESEND_API_KEY is set (e.g. RESEND_API_KEY=re_xxxxx)")
+        print("  - Do not mask or replace the value with '***'.")
+        logging.error("RESEND_API_KEY not found or masked; cannot send email.")
         return
-    
+
     try:
         print("Attempting to send email...")
         print(f"Recipient: {recipient_email}")
@@ -835,16 +842,16 @@ def main() -> None:
     # Collect all summaries for email
     all_summaries: List[Dict] = []
 
-    # Process tickers in parallel using ThreadPoolExecutor for speed optimization
+    # Process tickers sequentially (one at a time) for Gemini rate limit compliance
     print(f"\n{'='*60}")
-    print(f"Processing {len(ticker_to_name)} tickers in parallel...")
+    print(f"Processing {len(ticker_to_name)} tickers sequentially...")
     print(f"{'='*60}")
-    
-    def process_ticker_wrapper(args):
-        """Wrapper function for parallel processing."""
-        ticker, company_name = args
+
+    for ticker, company_name in ticker_to_name.items():
         try:
-            return process_ticker(ticker, company_name, query_api, supabase, gemini_client)
+            summaries = process_ticker(ticker, company_name, query_api, supabase, gemini_client)
+            all_summaries.extend(summaries)
+            print(f"✓ Completed: {company_name} ({ticker}) - {len(summaries)} summary(ies)")
         except Exception as exc:
             logging.error(
                 "Unexpected error while processing ticker %s: %s",
@@ -852,52 +859,17 @@ def main() -> None:
                 exc,
                 exc_info=True,
             )
-            # Return empty list on error, but ensure "No news" entry is still created
-            # Create a "No news" entry for this ticker even if processing failed
-            return [{
+            all_summaries.append({
                 "ticker": ticker,
                 "company_name": company_name,
-                "summary": (
-                    f"The Headline: {company_name}\n\n"
-                    f"The Body:\n"
-                    f"- Error processing ticker: {str(exc)}\n\n"
-                    f"The Data:\n"
-                    f"source_url: N/A"
-                ),
+                "summary": "No news.",
                 "source_url": None,
-            }]
-    
-    # Use ThreadPoolExecutor to process all tickers in parallel
-    with ThreadPoolExecutor(max_workers=min(len(ticker_to_name), 8)) as executor:
-        # Submit all ticker processing tasks
-        future_to_ticker = {
-            executor.submit(process_ticker_wrapper, (ticker, company_name)): (ticker, company_name)
-            for ticker, company_name in ticker_to_name.items()
-        }
-        
-        # Collect results as they complete
-        for future in as_completed(future_to_ticker):
-            ticker, company_name = future_to_ticker[future]
-            try:
-                summaries = future.result()
-                all_summaries.extend(summaries)
-                print(f"✓ Completed: {company_name} ({ticker}) - {len(summaries)} summary(ies)")
-            except Exception as exc:
-                logging.error(f"Error getting result for {ticker}: {exc}", exc_info=True)
-                # Ensure "No news" entry even if there was an error
-                all_summaries.append({
-                    "ticker": ticker,
-                    "company_name": company_name,
-                    "summary": "No news.",
-                    "source_url": None,
-                    "is_no_news": True,
-                })
-            print("--- Rate Limit Protection: Sleeping for 12 seconds ---")
-            time.sleep(12)
+                "is_no_news": True,
+            })
 
     # TICKER PROCESSING FINISHED - Now sending email
     print(f"\n{'='*60}")
-    print(f"PARALLEL PROCESSING COMPLETED. Processed {len(ticker_to_name)} tickers.")
+    print(f"SEQUENTIAL PROCESSING COMPLETED. Processed {len(ticker_to_name)} tickers.")
     print(f"Total summaries collected: {len(all_summaries)}")
     print(f"{'='*60}")
     
