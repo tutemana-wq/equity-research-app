@@ -2,7 +2,7 @@ name: Daily Equity Research Briefing
 
 on:
   schedule:
-    - cron: '0 13 * * *'  # Runs at 8:00 AM EST (13:00 UTC) every day
+    - cron: '0 10 * * *'  # Runs at 7:00 AM UTC-3 / ART (10:00 UTC) every day
   workflow_dispatch: # Allows manual triggering via "Run workflow" button
 
 jobs:
