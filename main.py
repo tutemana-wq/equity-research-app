@@ -501,17 +501,17 @@ def summarize_filing_with_gemini(
 
     prompt = (
         f"You are an elite researcher and gatekeeper.\n\n"
-        f"CRITICAL: If the provided SEC filing text is a generic market summary, "
-        f"a price forecast, routine administrative filing, or not specifically about a major "
-        f"company event (like executive changes, material agreements, financial restatements, "
-        f"or significant business developments), you MUST return exactly the string \"SKIP\" "
-        f"and nothing else. Do not summarize irrelevant noise.\n\n"
-        f"If the filing IS relevant and contains material investor risks, summarize it in exactly "
-        f"three concise bullet points focused ONLY on investor risks.\n"
+        f"CRITICAL: If the provided news or filing is a generic summary, "
+        f"routine administrative noise, or not a major event (executive changes, "
+        f"material agreements, earnings, or business developments), you MUST return "
+        f"exactly the string 'SKIP' and nothing else.\n\n"
+        f"If the content IS relevant, provide:\n"
+        f"1. Exactly three concise bullet points focused on material impact or risks.\n"
+        f"2. The direct source URL link at the very end.\n\n"
         f"- Each bullet should start with '- '.\n"
         f"- Do not include introductions or conclusions.\n\n"
-        f"Filing text begins below:\n\n"
-        f"{filing_text}"
+        f"CONTENT TO ANALYZE:\n"
+        f"{filing_text}" # This variable should contain the news/filing content
     )
 
     return generate_content_with_failover(prompt, client)
@@ -520,23 +520,29 @@ def summarize_filing_with_gemini(
 def search_web_and_ir_for_ticker(ticker, company_name):
     api_key = os.getenv("TAVILY_API_KEY")
     if not api_key: return []
+    
     clean_name = company_name.replace(", Inc.", "").replace(" Inc.", "").replace(" Corp.", "").replace(" Ltd.", "").strip()
     now_utc = datetime.now(timezone.utc)
     current_year = now_utc.year
     headers = {"Authorization": f"Bearer {api_key}"}
+    
     base_payload = {
         "search_depth": "advanced",
         "max_results": 5,
         "topic": "news", 
         "include_answer": False,
-        "start_date": (now_utc - timedelta(hours=WEB_LOOKBACK_HOURS)).date().isoformat(),
+        "start_date": (now_utc - timedelta(hours=72)).date().isoformat(),
         "end_date": now_utc.date().isoformat(),
     }
+
+    # High-signal queries targeting IR and SEC filings
     queries = [
-        f"{clean_name} {ticker} investor relations news {current_year}",
-        f"{clean_name} {ticker} earnings press release {current_year}",
-        f"{clean_name} {ticker} official announcement {current_year}"
+        f"site:sec.gov {ticker} {current_year} filing",
+        f"{clean_name} {ticker} (press release OR announcement) site:investor.apple.com OR site:ir.xponential.com", # Example pattern
+        f"{clean_name} {ticker} executive interview media",
+        f"intitle:8-K OR intitle:10-Q {ticker}"
     ]
+
     all_results = []
     for q in queries:
         try:
@@ -545,13 +551,22 @@ def search_web_and_ir_for_ticker(ticker, company_name):
                 all_results.extend(resp.json().get("results", []))
         except Exception as exc:
             logging.error(f"Search failed for {q}: {exc}")
+
     unique_results = []
     seen_urls = set()
     for r in all_results:
         url = r.get("url")
         if url and url not in seen_urls:
             seen_urls.add(url)
+            
+            # --- MANDATORY LINK INJECTION ---
+            # We explicitly prepend the URL to the content so the AI sees it
+            raw_content = r.get("content", r.get("snippet", ""))
+            r["content"] = f"SOURCE URL: {url}\n\nREPORTED CONTENT: {raw_content}"
+            # --------------------------------
+            
             unique_results.append(r)
+
     logging.info("Found %d unique results for %s.", len(unique_results), ticker)
     return unique_results
 
@@ -592,17 +607,16 @@ def summarize_external_with_gemini(
     prompt = (
         f"You are an elite researcher and gatekeeper.\n\n"
         f"CRITICAL: If the provided text is a generic market summary, a price forecast, "
-        f"stock price discussion, analyst target update, trading chart, or not specifically "
-        f"about a major company event (like CEO interviews, press releases about business "
-        f"developments, earnings calls, investor presentations, or significant corporate "
-        f"announcements), you MUST return exactly the string \"SKIP\" and nothing else. "
-        f"Do not summarize irrelevant noise.\n\n"
-        f"If the content IS relevant and contains material investor risks or significant "
-        f"company developments for {company_name} ({ticker}), summarize it in exactly "
-        f"three concise bullet points focused ONLY on investor risks.\n"
-        f"- Each bullet should start with '- '.\n"
-        f"- Do not include introductions or conclusions.\n\n"
-        f"Sources:\n\n"
+        f"stock price discussion, analyst target update, or not a major event (like CEO interviews, "
+        f"press releases, earnings, or corporate announcements), you MUST return "
+        f"exactly the string \"SKIP\" and nothing else.\n\n"
+        f"If the content IS relevant for {company_name} ({ticker}), you MUST:\n"
+        f"1. Summarize it in exactly three concise bullet points focused on material impact.\n"
+        f"2. Provide the 'Source Link' at the end of the summary.\n\n"
+        f"Formatting:\n"
+        f"- Each bullet starts with '- '.\n"
+        f"- No intro or outro text.\n\n"
+        f"CONTENT TO ANALYZE:\n"
         f"{combined_text}"
     )
 
